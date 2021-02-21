@@ -1,0 +1,272 @@
+#!/usr/bin/env python
+
+"""
+Node uses RealSense RGB-D lenses' data to detect a person's face and, once the
+person stands still, estimate their forehead's 3D pose in space.
+
+SUBSCRIBERS:
+    /camera/color/image_raw (sensor_msgs/Image): RealSense RGB color data
+
+    /camera/aligned_depth_to_color/image_raw (sensor_msgs/Image): RealSense depth data,
+                                                         aligned to the color lens' frame
+
+    /state (std_msgs/String): state of the overall control loop
+
+    /camera/color/camera_info (sensor_msgs/CameraInfo): intrinsic and extrinsic params of
+                                                        RealSense RGB color camera
+
+PUBLISHERS:
+    /face_pose (geometry_msgs/Pose): goal pose of person's forehead
+
+    /found_face (std_msgs/Bool): whether or not a face is currently detected
+"""
+
+import sys
+import rospy
+import cv2
+import tf2_ros
+import math
+
+from std_msgs.msg import String, Bool
+from sensor_msgs.msg import Image, CameraInfo
+from cv_bridge import CvBridge, CvBridgeError
+from geometry_msgs.msg import Pose, Point, TransformStamped, Vector3, Quaternion, Transform
+from image_geometry import PinholeCameraModel
+
+
+class FaceDetection:
+
+    def __init__(self):
+        # Load cascade configuration files
+        self.faceCascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+        # Initialize CvBridge object, which allows conversion between ROS message
+        # and OpenCV Image data type
+        self.bridge = CvBridge()
+
+        # Subscribe to RealSense RGB-D data and state from state machine
+        self.image_sub = rospy.Subscriber('/camera/color/image_raw',
+                                          Image,
+                                          self.image_callback)
+        self.depth_sub = rospy.Subscriber('/camera/aligned_depth_to_color/image_raw',
+                                          Image,
+                                          self.depth_callback)
+        self.state_sub = rospy.Subscriber('/state', String, self.state_callback)
+        self.camera_info_sub = rospy.Subscriber('/camera/color/camera_info',  # same as /camera/aligned_depth_to_color/image_raw
+                                                CameraInfo,
+                                                self.camera_info_callback)
+
+        self.state = None
+        self.camera_info = None
+
+        # Publish face pose and found face state for state machine
+        self.pose_pub = rospy.Publisher('/face_pose', Pose, queue_size=10)
+        self.found_face_pub = rospy.Publisher('/found_face', Bool, queue_size=10)
+
+        # Variables for face pose estimation
+        self.forehead_x = None  # x pixel location of forehead
+        self.forehead_y = None  # y pixel location of forehead
+        self.forehead_depth = None  # depth of location of forehead
+
+        # Transforms for face pose calculation
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster()
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+
+        # Initialize variables needed for opencv face detection loop
+        self.dx = []
+        self.dy = []
+        self.lockonThreshold = 2   # Pixel hysteresis
+        self.nSamples = 15         # Number of samples to track
+        self.lastX = 0
+        self.lastY = 0
+
+    def state_callback(self, data):
+        """ Used as the state callback.
+
+            Args:
+               data (std_msgs/String): the current state of control loop
+        """
+        self.state = data.data
+
+    def image_callback(self, data):
+        """ Used as the RGB image callback. Most of the image processing and
+            pose estimation happens here.
+
+            Args:
+               data (sensor_msgs/Image): RGB image data from RealSense color camera
+        """
+        # Attempt to pull frame from ROS message
+        try:
+            # Pull image as an 8-bit RGB image
+            self.incomingFrame = self.bridge.imgmsg_to_cv2(data, "bgr8")
+        except CvBridgeError as e:
+            # Print error if incoming frame cannot be pulled
+            print(e)
+
+        # Our operations on the frame come here
+        # Use OpenCV to convert the incoming frame into a grayscale frame
+        self.grayFrame = cv2.cvtColor(self.incomingFrame, cv2.COLOR_BGR2GRAY)
+
+        # Run the face cascade and look for faces, then output the number of faces found
+        self.faces = self.faceCascade.detectMultiScale(self.grayFrame, 1.3, 10)
+
+        # Publish if faces are found so state machine can tell the user
+        if self.faces != ():
+            self.found_face_pub.publish(Bool(data=True))
+        else:
+            self.found_face_pub.publish(Bool(data=False))
+
+        # Iterate over detected faces and draw a frame around each
+        for (x, y, w, h) in self.faces:
+
+            # Check length of dx and pop earliest element
+            if len(self.dx) > self.nSamples:
+                self.dx.pop(0)
+            if len(self.dy) > self.nSamples:
+                self.dy.pop(0)
+
+            # Check if face has stabilized
+            self.dx.append(abs(x - self.lastX))
+            self.dy.append(abs(y - self.lastY))
+
+            # Find average over last 10 frames
+            self.dxAverage = sum(self.dx)/len(self.dx)
+            self.dyAverage = sum(self.dy)/len(self.dy)
+
+            # If detected face is stationary (person stands still)
+            if (self.dxAverage < self.lockonThreshold) and \
+                    (self.dxAverage < self.lockonThreshold):
+
+                # Forehead position
+                self.forehead_x = int(round(x + w/2))
+                self.forehead_y = int(round(y + h/3))
+
+                # If forehead data has been received
+                if self.forehead_depth:
+
+                    # Initialize camera model and calibration params
+                    p = PinholeCameraModel()
+                    p.fromCameraInfo(self.camera_info)
+
+                    # This function takes 2D pixel and outputs unit vector of ray that
+                    # goes thru the pixel, all we need is depth now
+                    i, j, k = p.projectPixelTo3dRay((self.forehead_x,
+                                                    self.forehead_y))
+
+                    # Transform from world to RS RGB camera frame
+                    # This transform was manually approximated through trial and error but
+                    # accuracy was high
+                    Twr = Transform(
+                            translation=Vector3(
+                                x=0.1,
+                                y=0.03,
+                                z=0.87),
+                            rotation=Quaternion(
+                                x=0,
+                                y=0,
+                                z=0,
+                                w=1
+                            ))
+                    Twr_stamped = TransformStamped()
+                    Twr_stamped.header.stamp = rospy.Time.now()
+                    Twr_stamped.header.frame_id = "world"
+                    Twr_stamped.child_frame_id = "camera_aligned_depth_to_color_frame"
+                    Twr_stamped.transform = Twr
+
+                    self.tf_broadcaster.sendTransform(Twr_stamped)
+
+                    # Transform from RS RBG camera frame to face of person (forehead)
+                    Trf = Transform(
+                            translation=Vector3(
+                                x=self.forehead_depth * k,  # accounting for frame misalignment
+                                y=self.forehead_depth * -i,
+                                z=self.forehead_depth * -j),
+                            rotation=Quaternion(
+                                x=0,
+                                y=0,
+                                z=0,
+                                w=1
+                            ))
+                    Trf_stamped = TransformStamped()
+                    Trf_stamped.header.stamp = rospy.Time.now()
+                    Trf_stamped.header.frame_id = "camera_aligned_depth_to_color_frame"
+                    Trf_stamped.child_frame_id = "face"
+                    Trf_stamped.transform = Trf
+
+                    # Only publish frame if person is within 4 m distance
+                    # (to avoid noise and detecting people far away)
+                    if math.sqrt(Trf.translation.x**2 + Trf.translation.y**2
+                                 + Trf.translation.z**2) < 4:
+                        self.tf_broadcaster.sendTransform(Trf_stamped)
+
+                        # tf gives us transform from world to face (face pose in world)
+                        # which is the final goal of this node
+                        try:
+                            Twf = self.tf_buffer.lookup_transform('world',
+                                                                'face',
+                                                                rospy.Time())
+
+                            # Publish face pose so state machine can read and send to mover
+                            self.pose_pub.publish(Pose(position=Point(
+                                x=Twf.transform.translation.x,
+                                y=Twf.transform.translation.y,
+                                z=Twf.transform.translation.z)))
+
+                        except (tf2_ros.LookupException,
+                                tf2_ros.ConnectivityException,
+                                tf2_ros.ExtrapolationException):
+                            continue
+
+            else:
+
+                self.forehead_x = None
+                self.forehead_y = None
+
+            self.lastX = x
+            self.lastY = y
+
+    def depth_callback(self, data):
+        """ Used as the depth camera data callback.
+
+            Args:
+               data (sensor_msgs/Image): depth data from RealSense depth sensor
+        """
+        # Attempt to pull frame from ROS message
+        try:
+            # Pull image as an 8-bit RGB image
+            self.incomingFrame = self.bridge.imgmsg_to_cv2(
+                data, desired_encoding="passthrough")
+        except CvBridgeError as e:
+            # Print error if incoming frame cannot be pulled
+            print(e)
+
+        if self.forehead_x and self.forehead_y:
+
+            self.forehead_depth = self.incomingFrame[self.forehead_y,
+                                                     self.forehead_x] / 1000  # original units mm
+
+    def camera_info_callback(self, data):
+        """ Used as the RGB camera info callback.
+
+            Args:
+               data (sensor_msgs/CameraInfo): meta information of RealSense
+                                            RGB color camera
+        """
+        self.camera_info = data
+
+
+def main(args):
+    """ The main function. """
+    rospy.init_node('face_detection')
+    find_faces = FaceDetection()
+    try:
+        rospy.spin()
+    except KeyboardInterrupt:
+        print("Shutting down")
+    cv2.destroyAllWindows()
+
+
+if __name__ == '__main__':
+    main(sys.argv)
