@@ -13,7 +13,7 @@ The 'Covid Commando' is a Baxter robot that takes a person's temperature and ind
 5. Blocks or allows the person to pass.
 6. Finally returns to the first state, ready to repeat.
 
-## System Architecture s
+## System Architecture
 ![system architecture img](images/architecture.png)
 
 ### State Machine 
